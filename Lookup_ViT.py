@@ -25,6 +25,12 @@ class LookupTransformerBlock(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.layers = nn.ModuleList([])
 
+        self.q_linear = nn.Linear(dim, dim)
+        self.k_linear = nn.Linear(dim, dim)
+        self.v_linear = nn.Linear(dim, dim)
+
+        self.fc = nn.Linear(dim, dim)
+
         # 直接调用torch的多头注意力机制
         self.cross_attention = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, dropout=dropout, batch_first=True)
         self.self_attention = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, dropout=dropout, batch_first=True)
@@ -36,9 +42,9 @@ class LookupTransformerBlock(nn.Module):
 
         # ffn
         self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 4),
+            nn.Linear(dim, dim * 2),
             nn.GELU(),
-            nn.Linear(dim * 4, dim),
+            nn.Linear(dim * 2, dim),
             nn.Dropout(dropout)
         )
 
@@ -48,17 +54,21 @@ class LookupTransformerBlock(nn.Module):
         # compressed_patches: [B, M, D]
         # 1. compressed patch 和 lookup patch 之间做交叉注意力
         identity = compressed_patches
-        compressed_patches, attn_weights = self.cross_attention(query=compressed_patches, key=lookup_patches, value=lookup_patches)
+
+        q = self.norm1(self.q_linear(compressed_patches))
+        k = self.norm1(self.k_linear(lookup_patches))
+        v = self.v_linear(lookup_patches)
+
+        compressed_patches, attn_weights = self.cross_attention(query=q, key=k, value=v)
         compressed_patches = compressed_patches + identity
-        compressed_patches = self.norm1(compressed_patches)
         # attn_weights: [B, M, N]
         # 2. compressed patch 之间做自注意力
         compressed_patches = self.self_attention(query=compressed_patches, key=compressed_patches, value=compressed_patches)[0] + compressed_patches
-        compressed_patches = self.norm2(compressed_patches)
+        compressed_patches = self.fc(self.norm2(compressed_patches))
 
         # 3. 复用第一步的attn_weights，需要转置
         attn_weights = attn_weights.transpose(1, 2)
-        lookup_patches = lookup_patches + torch.matmul(attn_weights, compressed_patches)
+        lookup_patches = lookup_patches + torch.matmul(attn_weights, self.v_linear(compressed_patches))
         lookup_patches = self.norm3(lookup_patches)
 
         lookup_patches = self.ffn(lookup_patches)
@@ -92,7 +102,10 @@ class LookupViT(nn.Module):
             self.transformer.append(LookupTransformerBlock(dim, heads, dropout))
 
         # 最后的分类层
-        self.mlp_head = nn.Linear(dim, num_classes)
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
 
     def forward(self, img):
 
